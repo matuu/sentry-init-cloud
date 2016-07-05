@@ -1,0 +1,175 @@
+#cloud-config
+manage_etc_hosts: true
+apt_proxy: http://172.16.16.1:8000/
+http_proxy: http://172.16.16.1:8000/
+_foo: &SSH_KEY "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC5eevkMmUlTxruhespUgHPGO3y3db7hLlq0IPu2WmTf+8YW9MM8/RddGvf2Pwshe7uIz1RhALBluuEXyZXM4ZL4ePiktxUFRKy9a/BnphR/RsAxKQ+HRAAwXheEJ6q3vmjlIMG5GOJhn+br6lMtr/ojDwHrfC1NrSFr/jZkRR5K218Yt33Y7AzZm+ahVkZUHIbpQs4XehBThnMl2enxfum00pGChQJIlDL2jM4ZLMGTvbXe3Zv+70osS0+UDpO8di2CLxi42sDoquNcCvd4KLpG5droqJwf4WRmhleLvkW0H5rP1diUbO5Btu3nJMZVlBZLCSLeI5QKsaN81YwHJsf jujumanage@um-cloud-maas"
+
+_foo: &STORAGE_SH |
+  #!/bin/bash
+  DEV=/dev/vdb
+  MNT=/var/lib/mysql
+  echo "*** INFO: BEGIN $0 $*"
+  test -b $DEV || {
+    echo "*** INFO: $DEV not a block device, skipping $0"
+    exit 0
+  }
+  set -uxe
+  apt-get install -y xfsprogs
+  if file -s $DEV | grep filesystem; then
+    echo "*** INFO: $DEV already contains a filesystem, mounting:"
+  else
+    echo "*** INFO: creating xfs FS on $DEV"
+    mkfs.xfs -f $DEV
+  fi
+  grep -q $DEV /etc/fstab || echo $DEV $MNT xfs defaults 0 0 >> /etc/fstab
+  mkdir -p $MNT
+  mount -av
+  echo "*** INFO: END $0 $*"
+
+_foo: &DEPLOY_SH |
+  #!/bin/bash
+  echo "*** INFO: BEGIN $0 $*"
+  #Ponemos el mysql a atender por la red
+  sed -i.bak 's/127.0.0.1/0.0.0.0/g' /etc/mysql/mysql.conf.d/mysqld.cnf
+  #Restarteamos
+  /etc/init.d/mysql restart
+  echo "GRANT ALL PRIVILEGES ON *.* TO 'sentry'@'%' IDENTIFIED BY 'sentry_um_cloud';" | mysql -u root
+  ### Con storage, ahora no la DROPeamos ;)
+  echo "CREATE DATABASE sentry" | mysql -u root
+  echo "*** INFO: END $0 $*"
+  echo "/usr/local/src/boot_ip.sh" >> /etc/rc.local
+
+  #Descargamos consul
+  cd /tmp
+  wget http://192.168.3.251/consul/0.6.4/consul_0.6.4_linux_amd64.zip
+  unzip *.zip
+  cp consul /usr/local/sbin
+  #creamos users dirs para consul
+  useradd -d /var/consul -m consul
+  mkdir -p /etc/consul.d
+  echo "*** INFO: END $0 $*"
+
+_foo: &CONSUL_CONF |
+  {
+    "server": false,
+    "datacenter": "um-01",
+    "data_dir": "/var/consul",
+    "encrypt": "GIMbRTkH/rLwqjOWrMzrcw==",
+    "log_level": "INFO",
+    "domain": "cloud.um.edu.ar",
+    "enable_syslog": true,
+    "start_join": ["192.168.3.130"]
+  }
+
+_foo: &CONSUL_SERVICE |
+  {
+    "service":
+      {
+        "name": "mysql",
+        "tags": ["mysql"],
+        "port": 3306
+      }
+  }
+
+_foo: &CONSUL_INIT |
+  #! /bin/sh
+  ### BEGIN INIT INFO
+  # Provides:          consul
+  # Required-Start:    $syslog $time $remote_fs
+  # Required-Stop:     $syslog $time $remote_fs
+  # Default-Start:     2 3 4 5
+  # Default-Stop:      0 1 6
+  # Short-Description: Services/nodes/kv discovery and storage
+  # Description:       Debian init script for the consul agent
+  ### END INIT INFO
+  #
+  # Author:            Diego Navarro <navarrow@gmail.com>
+  #
+
+  PATH=/bin:/usr/bin:/sbin:/usr/sbin
+  DAEMON=/usr/local/sbin/consul
+  PIDFILE=/var/run/consul
+
+  test -x $DAEMON || exit 0
+
+  . /lib/lsb/init-functions
+
+  case "$1" in
+    start)
+          log_daemon_msg "Starting consul agent" "consul"
+          start_daemon -p $PIDFILE $DAEMON agent -config-dir /etc/consul.d -client 0.0.0.0
+          log_end_msg $?
+      ;;
+    stop)
+          log_daemon_msg "Stoping consul agent" "consul"
+          killproc -p $PIDFILE $DAEMON
+          log_end_msg $?
+      ;;
+    force-reload|restart)
+      $0 stop
+      $0 start
+      ;;
+    status)
+      status_of_proc -p $PIDFILE $DAEMON consul && exit 0 || exit $?
+      ;;
+    *)
+      echo "Usage: /etc/init.d/consul {start|stop|restart|force-reload|status}"
+      exit 1
+      ;;
+  esac
+  exit 0
+
+bootcmd:
+  - [ 'cloud-init-per', 'once', 'my_storage', 'bash', '-c', *STORAGE_SH ]
+
+groups:
+  - umcloud
+users:
+  - name: ubuntu
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    ssh-authorized-keys:
+      - *SSH_KEY
+    ssh-import-id: [jjo, navarrow, "EDITAR_LP"]
+    lock_passwd: true
+
+  - name: umcloud
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    ssh-authorized-keys:
+      - *SSH_KEY
+    ssh-import-id: [jjo, navarrow, "EDITAR_LP"]
+    primary-group: umcloud
+    lock_passwd: true
+
+write_files:
+  - content: *DEPLOY_SH
+    path: /usr/local/src/deploy.sh
+    permissions: '0755'
+  - content: *CONSUL_CONF
+    path: /etc/consul.d/client.json
+    permissions: '0644'
+  - content: *CONSUL_SERVICE
+    path: /etc/consul.d/mysql.json
+    permissions: '0644'
+  - content: *CONSUL_INIT
+    path: /etc/init.d/consul
+    permissions: '0755'
+
+### Deshabilitado por seguridad
+#chpasswd:
+#  list: |
+#    umcloud:umcloud
+#  expire: False
+
+packages:
+  - unzip
+  - mysql-server
+
+
+runcmd:
+  - [ /usr/local/src/deploy.sh ]
+  - [ update-rc.d, consul, defaults ]
+  - [ service, consul, start ]
+
+# vim: si et sw=2 ts=2

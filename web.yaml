@@ -1,0 +1,226 @@
+#cloud-config
+manage_etc_hosts: true
+apt_proxy: http://172.16.16.1:8000/
+http_proxy: http://172.16.16.1:8000/
+_foo: &SSH_KEY "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC5eevkMmUlTxruhespUgHPGO3y3db7hLlq0IPu2WmTf+8YW9MM8/RddGvf2Pwshe7uIz1RhALBluuEXyZXM4ZL4ePiktxUFRKy9a/BnphR/RsAxKQ+HRAAwXheEJ6q3vmjlIMG5GOJhn+br6lMtr/ojDwHrfC1NrSFr/jZkRR5K218Yt33Y7AzZm+ahVkZUHIbpQs4XehBThnMl2enxfum00pGChQJIlDL2jM4ZLMGTvbXe3Zv+70osS0+UDpO8di2CLxi42sDoquNcCvd4KLpG5droqJwf4WRmhleLvkW0H5rP1diUbO5Btu3nJMZVlBZLCSLeI5QKsaN81YwHJsf jujumanage@um-cloud-maas"
+_foo: &DEPLOY_SH |
+  #!/bin/bash
+  echo "*** INFO: BEGIN $0 $*"
+  # Instalamos dependencias de sentry
+  apt-get install -y build-essential python-dev python-pip python-virtualenv libxml2-dev libxslt-dev libz-dev libssl-dev libffi-dev libmysqlclient-dev libpq-dev libjpeg-dev
+  
+  # crear virtualenv e instalar sentry
+  cd ~
+  virtualenv env
+  source env/bin/activate
+  pip install -U sentry[mysql]
+  pip install mysql
+
+  sentry init
+  # Ajustamos la app para que se conecte a la DB
+  sed -i.bak 's/sentry.db.postgres/django.db.backends.mysql/g' .sentry/sentry.conf.py
+  sed -i.bak "s/'NAME': ''/'NAME': 'sentry'/g" .sentry/sentry.conf.py
+  sed -i.bak "s/'USER': 'postgres'/'USER': 'sentry'/g" .sentry/sentry.conf.py
+  sed -i.bak "s/'PASSWORD': ''/'PASSWORD': 'sentry_um_cloud'/g" .sentry/sentry.conf.py
+  sed -i.bak "s/'HOST': ''/'HOST': 'EDITAR_ENV-EDITAR_USUARIO-db.node.cloud.um.edu.ar'/g" .sentry/sentry.conf.py
+  echo "SENTRY_KEY = '`sentry config generate-secret-key`'" >> .sentry/sentry.conf.py
+  sentry upgrade --noinput
+   
+  #Descargamos consul
+  cd /tmp
+  wget http://192.168.3.251/consul/0.6.4/consul_0.6.4_linux_amd64.zip
+  unzip *.zip
+  cp consul /usr/local/sbin
+  #creamos users dirs para consul
+  useradd -d /var/consul -m consul
+  mkdir -p /etc/consul.d
+  # Mostramos resultado
+  my_ip=$(ip r get 1 | sed -nr 's/.*src (\S+).*/\1/p')
+  echo "*** INFO: READY, browse:"
+  echo "    http://${my_ip?}/"
+  echo "*** INFO: END $0 $*"
+
+_foo: &NGINX_CONF |
+  server {
+    listen 80;
+    location / {
+      proxy_pass http://localhost:9000;
+      proxy_redirect off;
+      proxy_set_header   Host              $host;
+      proxy_set_header   X-Real-IP         $remote_addr;
+      proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+      proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+  }
+
+_foo: &SUPERVISOR_SENTRY_WEB |
+  [program:sentry-web]
+  directory=/root/
+  command=/root/env/bin/sentry run web
+  stdout_logfile=/root/logs-sentry.log
+  autostart=true
+  autorestart=true
+  redirect_stderr=true
+
+_foo: &SUPERVISOR_SENTRY_WORKER |
+  [program:sentry-worker]
+  directory=/root/
+  command=/root/env/bin/sentry run worker
+  stdout_logfile=/root/logs-sentry-worker.log
+  autostart=true
+  autorestart=true
+  redirect_stderr=true
+  killasgroup=true
+
+_foo: &SUPERVISOR_REDIS |
+  [program:redis-server]
+  command=/usr/bin/redis-server
+  autostart=true
+  autorestart=true
+  redirect_stderr=true
+
+_foo: &CONSUL_CONF |
+  {
+    "server": false,
+    "datacenter": "um-01",
+    "data_dir": "/var/consul",
+    "encrypt": "GIMbRTkH/rLwqjOWrMzrcw==",
+    "log_level": "INFO",
+    "domain": "cloud.um.edu.ar",
+    "enable_syslog": true,
+    "start_join": ["192.168.3.130"]
+  }
+
+_foo: &CONSUL_SERVICE |
+  {
+    "service":
+      {
+        "name": "sentry",
+        "tags": ["nginx"],
+        "port": 80
+      }
+  }
+
+_foo: &CONSUL_INIT |
+  #! /bin/sh
+  ### BEGIN INIT INFO
+  # Provides:          consul
+  # Required-Start:    $syslog $time $remote_fs
+  # Required-Stop:     $syslog $time $remote_fs
+  # Default-Start:     2 3 4 5
+  # Default-Stop:      0 1 6
+  # Short-Description: Services/nodes/kv discovery and storage
+  # Description:       Debian init script for the consul agent
+  ### END INIT INFO
+  #
+  # Author:            Diego Navarro <navarrow@gmail.com>
+  #
+
+  PATH=/bin:/usr/bin:/sbin:/usr/sbin
+  DAEMON=/usr/local/sbin/consul
+  PIDFILE=/var/run/consul
+
+  test -x $DAEMON || exit 0
+
+  . /lib/lsb/init-functions
+
+  case "$1" in
+    start)
+          log_daemon_msg "Starting consul agent" "consul"
+          start_daemon -p $PIDFILE $DAEMON agent -config-dir /etc/consul.d -client 0.0.0.0
+          log_end_msg $?
+      ;;
+    stop)
+          log_daemon_msg "Stoping consul agent" "consul"
+          killproc -p $PIDFILE $DAEMON
+          log_end_msg $?
+      ;;
+    force-reload|restart)
+      $0 stop
+      $0 start
+      ;;
+    status)
+      status_of_proc -p $PIDFILE $DAEMON consul && exit 0 || exit $?
+      ;;
+    *)
+      echo "Usage: /etc/init.d/consul {start|stop|restart|force-reload|status}"
+      exit 1
+      ;;
+  esac
+  exit 0
+
+groups:
+  - umcloud
+users:
+  - name: ubuntu
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    ssh-authorized-keys:
+      - *SSH_KEY
+    ssh-import-id: [jjo, navarrow, "EDITAR_LP"]
+    lock_passwd: true
+
+  - name: umcloud
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    ssh-authorized-keys:
+      - *SSH_KEY
+    ssh-import-id: [jjo, navarrow, "EDITAR_LP"]
+    primary-group: umcloud
+    lock_passwd: true
+
+write_files:
+  - content: *DEPLOY_SH
+    path: /usr/local/src/deploy.sh
+    permissions: '0755'
+  - content: *CONSUL_CONF
+    path: /etc/consul.d/client.json
+    permissions: '0644'
+  - content: *CONSUL_SERVICE
+    path: /etc/consul.d/web.json
+    permissions: '0644'
+  - content: *CONSUL_INIT
+    path: /etc/init.d/consul
+    permissions: '0755'
+
+  - content: *NGINX_CONF
+    path: /etc/nginx/sites-available/default
+    permissions: '0644'
+  - content: *SUPERVISOR_SENTRY_WEB
+    path: /etc/supervisor/conf.d/sentry-web.conf
+    permissions: '0644'
+  - content: *SUPERVISOR_SENTRY_WORKER
+    path: /etc/supervisor/conf.d/sentry-worker.conf
+    permissions: '0644'
+  - content: *SUPERVISOR_REDIS
+    path: /etc/supervisor/conf.d/sentry-redis.conf
+    permissions: '0644'
+
+### Deshabilitado por seguridad
+#chpasswd:
+#  list: |
+#    umcloud:umcloud
+#  expire: False
+#
+
+# Optimization speed up apt by shortcutting fsync() calls/etc
+apt_get_wrapper:
+  command: eatmydata
+  enabled: True
+
+packages:
+  - unzip
+  - nginx
+  - supervisor
+  - redis-server
+
+runcmd:
+  - [ /usr/local/src/deploy.sh ]
+  - [ update-rc.d, consul, defaults ]
+  - [ service, consul, start ]
+  - [ service, nginx, restart ]
+  - [ service, supervisor, restart ]
+  - [ supervisorctl, reread ]
+  - [ supervisorctl, update ]
+
+# vim: si et sw=2 ts=2

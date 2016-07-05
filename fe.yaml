@@ -1,0 +1,198 @@
+#cloud-config
+manage_etc_hosts: true
+apt_proxy: http://172.16.16.1:8000/
+http_proxy: http://172.16.16.1:8000/
+_foo: &SSH_KEY "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC5eevkMmUlTxruhespUgHPGO3y3db7hLlq0IPu2WmTf+8YW9MM8/RddGvf2Pwshe7uIz1RhALBluuEXyZXM4ZL4ePiktxUFRKy9a/BnphR/RsAxKQ+HRAAwXheEJ6q3vmjlIMG5GOJhn+br6lMtr/ojDwHrfC1NrSFr/jZkRR5K218Yt33Y7AzZm+ahVkZUHIbpQs4XehBThnMl2enxfum00pGChQJIlDL2jM4ZLMGTvbXe3Zv+70osS0+UDpO8di2CLxi42sDoquNcCvd4KLpG5droqJwf4WRmhleLvkW0H5rP1diUbO5Btu3nJMZVlBZLCSLeI5QKsaN81YwHJsf jujumanage@um-cloud-maas"
+_foo: &DEPLOY_SH |
+  #!/bin/bash
+  echo "*** INFO: BEGIN $0 $*"
+  #Descargamos consul
+  cd /tmp
+  wget http://192.168.3.251/consul/0.6.4/consul_0.6.4_linux_amd64.zip
+  unzip *.zip
+  cp consul /usr/local/sbin
+  #creamos users dirs para consul
+  useradd -d /var/consul -m consul
+  mkdir -p /etc/consul.d
+  set -x
+  # truchisimo pero bueh, ver http://www.serverphorums.com/read.php?10,1248602
+  sleep 120
+  service haproxy restart
+  echo "*** INFO: END $0 $*"
+
+_foo: &HAPROXY_CONF |
+  global
+      log 127.0.0.1 local0
+      log 127.0.0.1 local1 notice
+      maxconn 20000
+      user haproxy
+      group haproxy
+      spread-checks 0
+  
+  defaults
+      log global
+      mode tcp
+      option httplog
+      option dontlognull
+      retries 3
+      timeout connect 5000
+      timeout client  50000
+      timeout server  50000
+  
+  resolvers mydns
+      nameserver dns1 192.168.3.130:53
+      resolve_retries       3
+      timeout retry         1s
+      hold valid            1s
+  
+  listen stats
+      #bind 127.0.0.1:8888
+      bind 0.0.0.0:8888
+      mode http
+      stats enable
+      stats hide-version
+      stats realm Haproxy\ Statistics
+      stats uri /
+  
+  frontend web
+      bind *:80
+      mode http
+      default_backend web-nodes
+  
+  backend web-nodes
+      balance leastconn
+      mode http
+      option httpchk GET /
+      server webapp-1 EDITAR_ENV-EDITAR_USUARIO-web-1.node.cloud.um.edu.ar:80 check resolvers mydns
+      server webapp-2 EDITAR_ENV-EDITAR_USUARIO-web-2.node.cloud.um.edu.ar:80 check resolvers mydns
+
+_foo: &CONSUL_CONF |
+  {
+    "server": false,
+    "datacenter": "um-01",
+    "data_dir": "/var/consul",
+    "encrypt": "GIMbRTkH/rLwqjOWrMzrcw==",
+    "log_level": "INFO",
+    "domain": "cloud.um.edu.ar",
+    "enable_syslog": true,
+    "start_join": ["192.168.3.130"]
+  }
+
+_foo: &CONSUL_SERVICE |
+  {
+    "service":
+      {
+        "name": "fe",
+        "tags": ["haproxy"],
+        "port": 80
+      }
+  }
+
+_foo: &CONSUL_INIT |
+  #! /bin/sh
+  ### BEGIN INIT INFO
+  # Provides:          consul
+  # Required-Start:    $syslog $time $remote_fs
+  # Required-Stop:     $syslog $time $remote_fs
+  # Default-Start:     2 3 4 5
+  # Default-Stop:      0 1 6
+  # Short-Description: Services/nodes/kv discovery and storage
+  # Description:       Debian init script for the consul agent
+  ### END INIT INFO
+  #
+  # Author:            Diego Navarro <navarrow@gmail.com>
+  #
+
+  PATH=/bin:/usr/bin:/sbin:/usr/sbin
+  DAEMON=/usr/local/sbin/consul
+  PIDFILE=/var/run/consul
+
+  test -x $DAEMON || exit 0
+
+  . /lib/lsb/init-functions
+
+  case "$1" in
+    start)
+          log_daemon_msg "Starting consul agent" "consul"
+          start_daemon -p $PIDFILE $DAEMON agent -config-dir /etc/consul.d -client 0.0.0.0
+          log_end_msg $?
+      ;;
+    stop)
+          log_daemon_msg "Stoping consul agent" "consul"
+          killproc -p $PIDFILE $DAEMON
+          log_end_msg $?
+      ;;
+    force-reload|restart)
+      $0 stop
+      $0 start
+      ;;
+    status)
+      status_of_proc -p $PIDFILE $DAEMON consul && exit 0 || exit $?
+      ;;
+    *)
+      echo "Usage: /etc/init.d/consul {start|stop|restart|force-reload|status}"
+      exit 1
+      ;;
+  esac
+  exit 0
+
+groups:
+  - umcloud
+users:
+  - name: ubuntu
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    ssh-authorized-keys:
+      - *SSH_KEY
+    ssh-import-id: [jjo, navarrow, "EDITAR_LP"]
+    lock_passwd: true
+
+  - name: umcloud
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    ssh-authorized-keys:
+      - *SSH_KEY
+    ssh-import-id: [jjo, navarrow, "EDITAR_LP"]
+    primary-group: umcloud
+    lock_passwd: true
+
+write_files:
+  - content: *HAPROXY_CONF
+    path: /etc/haproxy/haproxy.cfg
+    permissions: '0644'
+  - content: *DEPLOY_SH
+    path: /usr/local/src/deploy.sh
+    permissions: '0755'
+  - content: *CONSUL_CONF
+    path: /etc/consul.d/client.json
+    permissions: '0644'
+  - content: *CONSUL_SERVICE
+    path: /etc/consul.d/fe.json
+    permissions: '0644'
+  - content: *CONSUL_INIT
+    path: /etc/init.d/consul
+    permissions: '0755'
+
+### Deshabilitado por seguridad
+#chpasswd:
+#  list: |
+#    umcloud:umcloud
+#  expire: False
+#
+
+# Optimization speed up apt by shortcutting fsync() calls/etc
+apt_get_wrapper:
+  command: eatmydata
+  enabled: True
+
+packages:
+  - unzip
+  - haproxy
+
+runcmd:
+  - [ /usr/local/src/deploy.sh ]
+  - [ update-rc.d, consul, defaults ]
+  - [ service, consul, start ]
+  - [ service, haproxy, restart ]
+
+# vim: si et sw=2 ts=2
